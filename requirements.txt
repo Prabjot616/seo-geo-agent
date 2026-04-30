@@ -2,3 +2,5 @@ google-adk
 requests
 beautifulsoup4
 python-dotenv
+google-cloud-firestore
+serpapi

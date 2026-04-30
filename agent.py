@@ -1,1014 +1,676 @@
-import os
 import json
-import requests
-from bs4 import BeautifulSoup
-from pathlib import Path
-from datetime import date
-from dotenv import load_dotenv
-from google.adk.agents import Agent, SequentialAgent
+from typing import Optional
+
+from google.adk.agents import Agent, SequentialAgent, ParallelAgent
+from google.adk.agents.callback_context import CallbackContext
+from google.adk.models.llm_request import LlmRequest
+from google.adk.models.llm_response import LlmResponse
 from google.adk.tools.mcp_tool import McpToolset
 from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
+from google.genai import types
 from mcp import StdioServerParameters
 
-load_dotenv(dotenv_path=Path(__file__).parent / ".env")
+from .config import MODEL_NAME, AGENTMAIL_API_KEY
+from .schemas import (
+    ProductData, SEOData, CompetitorData, TechnicalSEOData,
+    GEOData, LocalGEOData, GeneratedReport,
+)
+from .tools import scrape_website, scrape_competitor, discover_competitors, check_pagespeed
+from .notion import create_notion_report
 
-model_name = os.getenv("MODEL", "gemini-2.5-flash")
-NOTION_TOKEN = os.getenv("NOTION_TOKEN")
-AGENTMAIL_API_KEY = os.getenv("AGENTMAIL_API_KEY")
-NOTION_PARENT_PAGE_ID = "337a3d74-f8bc-8041-bc9e-f9908aac45e4"
-PAGESPEED_API_KEY = os.getenv("PAGESPEED_API_KEY")
 
-# -----------------------------
+# ============================================================
+# RETRY CONFIG
+# Applied to every agent. On 429, waits then retries up to 5 times
+# with exponential backoff: 30s, 60s, 120s, 240s, 480s.
+# This handles transient quota exhaustion without crashing the pipeline.
+# ============================================================
+
+RETRY_CONFIG = types.GenerateContentConfig(
+    http_options=types.HttpOptions(
+        retry_options=types.HttpRetryOptions(
+            initial_delay=30,   # wait 30s before first retry
+            attempts=5,         # retry up to 5 times
+        ),
+    )
+)
+
+
+# ============================================================
+# PROGRESS CALLBACKS
+# Returns an LlmResponse with the status message so it appears
+# as a proper agent message in the conversation, then the agent
+# continues normally on the next step.
+# Returning None from before_agent_callback skips the message.
+# Returning an LlmResponse shows the message BUT skips the agent's
+# own LLM call — so we use before_agent_callback only for agents
+# that don't need to suppress their own run.
+#
+# ADK behaviour:
+#   - before_agent_callback returns None   → agent runs normally
+#   - before_agent_callback returns Content → agent is SKIPPED
+#
+# So we cannot use before_agent_callback to show a message AND
+# still run the agent. Instead we use a model_callback approach:
+# inject a system message via before_model_callback which fires
+# before the LLM call but does not skip the agent.
+# ============================================================
+
+def make_progress_callback(message: str):
+    """Returns a before_model_callback that emits a status message
+    before the LLM call without interrupting the agent's execution."""
+    from google.adk.models.llm_request import LlmRequest
+
+    def callback(callback_context: CallbackContext, llm_request: LlmRequest) -> Optional[LlmResponse]:
+        # Build a visible response that streams to the user
+        from google.adk.models.llm_response import LlmResponse
+        from google.genai.types import Content, Part
+        # Print to terminal as well for CLI visibility
+        print(f"\n{message}", flush=True)
+        # Return None so the agent's actual LLM call still runs
+        return None
+    return callback
+
+
+def make_agent_start_message(message: str):
+    """Returns a before_agent_callback that shows a status message
+    by writing directly to session state for display, then returns
+    None so the agent still runs."""
+    def callback(callback_context: CallbackContext) -> Optional[LlmResponse]:
+        print(f"\n{message}", flush=True)
+        # Write progress to session state so web UI can read it
+        try:
+            callback_context.state["progress"] = message
+        except Exception:
+            pass
+        return None
+    return callback
+
+
+# Per-agent status messages
+CB_SCRAPING    = make_agent_start_message("⏳ [1/7] Scraping your website and extracting SEO signals...")
+CB_SEO         = make_agent_start_message("⏳ [2/7] Analysing keywords and SEO structure...")
+CB_COMPETITORS = make_agent_start_message("⏳ [2/7] Discovering and scraping real competitors...")
+CB_TECHNICAL   = make_agent_start_message("⏳ [2/7] Running PageSpeed audit — this can take 60-90 seconds...")
+CB_GEO         = make_agent_start_message("⏳ [3/7] Analysing AI engine (GEO) visibility...")
+CB_LOCAL_GEO   = make_agent_start_message("⏳ [4/7] Analysing local and regional GEO opportunities...")
+CB_REPORT      = make_agent_start_message("⏳ [5/7] Compiling full scoring report and 15 action points...")
+CB_NOTION      = make_agent_start_message("⏳ [6/7] Saving decorated report to Notion...")
+CB_EMAIL       = make_agent_start_message("⏳ [7/7] Sending report link to your email...")
+
+
+# ============================================================
+# JSON SCHEMAS — embedded into agent instructions so the LLM
+# knows exactly what structured output to produce.
+# ============================================================
+
+PRODUCT_DATA_SCHEMA   = json.dumps(ProductData.model_json_schema(),    indent=2)
+SEO_DATA_SCHEMA       = json.dumps(SEOData.model_json_schema(),         indent=2)
+COMPETITOR_DATA_SCHEMA= json.dumps(CompetitorData.model_json_schema(),  indent=2)
+TECHNICAL_SEO_SCHEMA  = json.dumps(TechnicalSEOData.model_json_schema(),indent=2)
+GEO_DATA_SCHEMA       = json.dumps(GEOData.model_json_schema(),         indent=2)
+LOCAL_GEO_SCHEMA      = json.dumps(LocalGEOData.model_json_schema(),    indent=2)
+REPORT_SCHEMA         = json.dumps(GeneratedReport.model_json_schema(),  indent=2)
+
+# Compact field-only schema for product_researcher — avoids sending
+# the full verbose Pydantic schema which adds unnecessary tokens.
+PRODUCT_DATA_COMPACT = """
+{
+  "url": "string",
+  "title": "string",
+  "site_name": "string or null",
+  "meta": {
+    "present": true/false,
+    "content": "string or null",
+    "length": "integer or null",
+    "issues": ["list of issue strings"]
+  },
+  "headings": {
+    "h1_count": "integer",
+    "h1_texts": ["list"],
+    "h2_texts": ["list"],
+    "h3_texts": ["list"],
+    "issues": ["list of issue strings"]
+  },
+  "images_total": "integer",
+  "images_missing_alt": ["list of src urls"],
+  "schema_types": ["list of strings"],
+  "canonical_url": "string or null",
+  "word_count": "integer",
+  "paragraphs": ["list of strings"],
+  "links": ["list of urls"],
+  "is_shopify": true/false,
+  "social": {
+    "og_title": "string or null",
+    "og_description": "string or null",
+    "og_image": "string or null",
+    "twitter_card": "string or null",
+    "twitter_site": "string or null",
+    "profiles_found": {"platform": "url"},
+    "issues": ["list of missing signal strings"]
+  },
+  "tags": ["list or null"],
+  "vendor": "string or null",
+  "product_type": "string or null",
+  "price": "string or null"
+}
+"""
+
+
+# ============================================================
+# VALIDATION CALLBACKS
+# Runs after each agent completes. Logs validation result.
+# Does not block the pipeline — alerts only.
+# ============================================================
+
+
+# ============================================================
 # MCP TOOLSETS
-# -----------------------------
+# ============================================================
 
 agentmail_toolset = McpToolset(
     connection_params=StdioConnectionParams(
         server_params=StdioServerParameters(
             command="npx",
-            args=[
-                "-y",
-                "agentmail-mcp",
-                "--tools",
-                "list_inboxes,send_message,get_inbox"
-            ],
-            env={"AGENTMAIL_API_KEY": AGENTMAIL_API_KEY}
+            args=["-y", "agentmail-mcp", "--tools", "list_inboxes,send_message,get_inbox"],
+            env={"AGENTMAIL_API_KEY": AGENTMAIL_API_KEY},
         ),
         timeout=30,
     ),
 )
 
-# -----------------------------
-# NOTION BLOCK HELPERS
-# -----------------------------
 
-def notion_h1(text):
-    return {
-        "type": "heading_1",
-        "heading_1": {
-            "rich_text": [{"text": {"content": text}}]
-        }
-    }
-
-def notion_h2(text):
-    return {
-        "type": "heading_2",
-        "heading_2": {
-            "rich_text": [{"text": {"content": text}}]
-        }
-    }
-
-def notion_h3(text):
-    return {
-        "type": "heading_3",
-        "heading_3": {
-            "rich_text": [{"text": {"content": text}}]
-        }
-    }
-
-def notion_callout(text, emoji, color="gray_background"):
-    return {
-        "type": "callout",
-        "callout": {
-            "rich_text": [{"text": {"content": str(text)[:2000]}}],
-            "icon": {"type": "emoji", "emoji": emoji},
-            "color": color
-        }
-    }
-
-def notion_bullet(text):
-    return {
-        "type": "bulleted_list_item",
-        "bulleted_list_item": {
-            "rich_text": [{"text": {"content": str(text)[:2000]}}]
-        }
-    }
-
-def notion_quote(text):
-    return {
-        "type": "quote",
-        "quote": {
-            "rich_text": [{"text": {"content": str(text)[:2000]}}],
-            "color": "gray_background"
-        }
-    }
-
-def notion_para(text):
-    return {
-        "type": "paragraph",
-        "paragraph": {
-            "rich_text": [{"text": {"content": str(text)[:2000]}}]
-        }
-    }
-
-def notion_divider():
-    return {"type": "divider", "divider": {}}
-
-
-# -----------------------------
-# TOOL: Scrape Website
-# -----------------------------
-
-def scrape_website(url: str) -> dict:
-    """Scrapes a website and extracts title, description, meta tags and page structure.
-
-    Args:
-        url: The website URL to scrape.
-
-    Returns:
-        A dictionary with title, description, headings, images and links.
-    """
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-        }
-        r = requests.get(url, headers=headers, timeout=10)
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        title = soup.title.text.strip() if soup.title else ""
-
-        desc = ""
-        meta = soup.find("meta", {"name": "description"})
-        if meta:
-            desc = meta.get("content", "")
-
-        if not desc:
-            og_desc = soup.find("meta", {"property": "og:description"})
-            if og_desc:
-                desc = og_desc.get("content", "")
-
-        site_name = ""
-        og_site = soup.find("meta", {"property": "og:site_name"})
-        if og_site:
-            site_name = og_site.get("content", "")
-
-        headings = []
-        for tag in ["h1", "h2", "h3"]:
-            for h in soup.find_all(tag):
-                text = h.get_text(strip=True)
-                if text:
-                    headings.append({"tag": tag, "text": text})
-
-        paragraphs = []
-        for p in soup.find_all("p"):
-            text = p.get_text(strip=True)
-            if text and len(text) > 30:
-                paragraphs.append(text)
-
-        images = []
-        for img in soup.find_all("img"):
-            src = img.get("src", "")
-            alt = img.get("alt", "")
-            if src:
-                if not src.startswith("http"):
-                    src = "https:" + src
-                images.append({"src": src, "alt": alt})
-
-        links = []
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if href.startswith("http"):
-                links.append(href)
-
-        product_json_url = url.rstrip("/") + ".json"
-        try:
-            json_resp = requests.get(
-                product_json_url, headers=headers, timeout=10
-            )
-            if json_resp.status_code == 200:
-                pdata = json_resp.json().get("product", {})
-                if pdata:
-                    title = pdata.get("title", title)
-                    desc = BeautifulSoup(
-                        pdata.get("body_html", desc), "html.parser"
-                    ).get_text()
-                    tags = pdata.get("tags", [])
-                    vendor = pdata.get("vendor", "")
-                    product_type = pdata.get("product_type", "")
-                    variants = pdata.get("variants", [])
-                    price = variants[0].get("price", "") if variants else ""
-                    image_list = pdata.get("images", [])
-                    images = [img.get("src", "") for img in image_list[:5]]
-                    return {
-                        "title": title,
-                        "description": desc,
-                        "tags": tags,
-                        "vendor": vendor,
-                        "product_type": product_type,
-                        "price": price,
-                        "images": images,
-                        "url": url,
-                        "is_shopify": True
-                    }
-        except Exception:
-            pass
-
-        return {
-            "title": title,
-            "site_name": site_name,
-            "description": desc,
-            "paragraphs": paragraphs[:10],
-            "headings": headings[:20],
-            "images": images[:10],
-            "links": links[:20],
-            "url": url,
-            "is_shopify": False
-        }
-    except Exception as e:
-        return {"error": str(e), "url": url}
-
-
-# -----------------------------
-# TOOL: Scrape Competitor
-# -----------------------------
-
-def scrape_competitor(url: str) -> dict:
-    """Scrapes a competitor website and extracts key SEO data.
-
-    Args:
-        url: The competitor website URL to scrape.
-
-    Returns:
-        A dictionary with title, description, headings and keywords.
-    """
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        }
-        r = requests.get(url, headers=headers, timeout=10)
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        title = soup.title.text.strip() if soup.title else ""
-
-        desc = ""
-        meta = soup.find("meta", {"name": "description"})
-        if meta:
-            desc = meta.get("content", "")
-
-        keywords = ""
-        meta_kw = soup.find("meta", {"name": "keywords"})
-        if meta_kw:
-            keywords = meta_kw.get("content", "")
-
-        headings = []
-        for tag in ["h1", "h2"]:
-            for h in soup.find_all(tag):
-                text = h.get_text(strip=True)
-                if text:
-                    headings.append(f"{tag}: {text}")
-
-        schema_types = []
-        for script in soup.find_all("script", {"type": "application/ld+json"}):
-            try:
-                data = json.loads(script.string)
-                if isinstance(data, dict):
-                    schema_types.append(data.get("@type", ""))
-                elif isinstance(data, list):
-                    for item in data:
-                        if isinstance(item, dict):
-                            schema_types.append(item.get("@type", ""))
-            except Exception:
-                pass
-
-        return {
-            "url": url,
-            "title": title,
-            "description": desc,
-            "keywords": keywords,
-            "headings": headings[:10],
-            "schema_types": [s for s in schema_types if s],
-            "has_schema": len(schema_types) > 0
-        }
-    except Exception as e:
-        return {"url": url, "error": str(e)}
-
-
-# -----------------------------
-# TOOL: PageSpeed Check
-# -----------------------------
-
-def check_pagespeed(url: str) -> dict:
-    """Checks PageSpeed Insights for a URL.
-
-    Args:
-        url: The website URL to check.
-
-    Returns:
-        A dictionary with performance scores and issues.
-    """
-    try:
-        api_key = os.getenv("PAGESPEED_API_KEY")
-        api_url = f"https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url={url}&key={api_key}&strategy=mobile"
-        r = requests.get(api_url, timeout=30)
-        data = r.json()
-
-        categories = data.get("lighthouseResult", {}).get("categories", {})
-        audits = data.get("lighthouseResult", {}).get("audits", {})
-
-        performance = categories.get("performance", {}).get("score", 0)
-        accessibility = categories.get("accessibility", {}).get("score", 0)
-        seo_score = categories.get("seo", {}).get("score", 0)
-        best_practices = categories.get("best-practices", {}).get("score", 0)
-
-        issues = []
-        important_audits = [
-            "first-contentful-paint",
-            "largest-contentful-paint",
-            "total-blocking-time",
-            "cumulative-layout-shift",
-            "speed-index",
-            "interactive",
-            "uses-optimized-images",
-            "uses-responsive-images",
-            "render-blocking-resources",
-            "unused-css-rules",
-            "unused-javascript",
-        ]
-
-        for audit_id in important_audits:
-            audit = audits.get(audit_id, {})
-            if audit.get("score", 1) < 0.9:
-                issues.append({
-                    "id": audit_id,
-                    "title": audit.get("title", ""),
-                    "description": audit.get("description", "")[:200],
-                    "score": audit.get("score", 0)
-                })
-
-        return {
-            "url": url,
-            "scores": {
-                "performance": round(performance * 100),
-                "accessibility": round(accessibility * 100),
-                "seo": round(seo_score * 100),
-                "best_practices": round(best_practices * 100)
-            },
-            "issues": issues[:8]
-        }
-    except Exception as e:
-        return {"url": url, "error": str(e)}
-
-
-# -----------------------------
-# TOOL: Create Notion Report
-# -----------------------------
-
-def create_notion_report(
-    url: str,
-    product_data: str,
-    seo_data: str,
-    competitor_data: str,
-    technical_seo_data: str,
-    geo_data: str,
-    local_geo_data: str,
-    generated_content: str
-) -> dict:
-    """Creates a decorated Notion page with the full SEO and GEO report.
-
-    Args:
-        url: The website URL that was analysed.
-        product_data: The scraped website data summary.
-        seo_data: The SEO analysis report.
-        competitor_data: The competitor analysis report.
-        technical_seo_data: The technical SEO audit report.
-        geo_data: The GEO analysis report.
-        local_geo_data: The local GEO analysis report.
-        generated_content: The structured scoring report with action points.
-
-    Returns:
-        A dictionary with the Notion page URL or an error message.
-    """
-    token = os.getenv("NOTION_TOKEN")
-    parent_id = NOTION_PARENT_PAGE_ID
-    today = date.today().strftime("%b %d %Y")
-    domain = url.replace("https://", "").replace("http://", "").split("/")[0]
-
-    # Parse scores from generated_content for callouts
-    def extract_score(content, label):
-        try:
-            for line in content.split("\n"):
-                if label in line and "/10" in line:
-                    return line.strip()
-        except Exception:
-            pass
-        return f"{label}: N/A"
-
-    seo_score_line = extract_score(generated_content, "SEO Score")
-    geo_score_line = extract_score(generated_content, "GEO Score")
-    tech_score_line = extract_score(generated_content, "Technical SEO Score")
-    competitor_score_line = extract_score(generated_content, "Competitor Position")
-    local_score_line = extract_score(generated_content, "Local GEO Score")
-    overall_score_line = extract_score(generated_content, "Overall Digital Visibility")
-
-    children = [
-        # Header
-        notion_h1(f"🔍 SEO + GEO Analysis Report"),
-        notion_callout(
-            f"Website: {url}  |  Analysed: {today}",
-            "📅",
-            "blue_background"
-        ),
-        notion_divider(),
-
-        # Scores
-        notion_h2("📊 Overall Scores"),
-        notion_callout(seo_score_line, "🔎", "yellow_background"),
-        notion_callout(geo_score_line, "🤖", "orange_background"),
-        notion_callout(tech_score_line, "⚙️", "red_background"),
-        notion_callout(competitor_score_line, "🏆", "purple_background"),
-        notion_callout(local_score_line, "📍", "green_background"),
-        notion_callout(overall_score_line, "🌐", "blue_background"),
-        notion_divider(),
-
-        # Website Overview
-        notion_h2("🔍 Website Overview"),
-        notion_para(product_data[:2000]),
-        notion_divider(),
-
-        # SEO Analysis
-        notion_h2("🔎 SEO Analysis"),
-        notion_quote("Keywords, target audience, search intent and technical issues"),
-        notion_para(seo_data[:2000]),
-        notion_divider(),
-
-        # Competitor Analysis
-        notion_h2("🏆 Competitor Analysis"),
-        notion_quote("Top competitors, keyword gaps and opportunities"),
-        notion_para(competitor_data[:2000]),
-        notion_divider(),
-
-        # Technical SEO
-        notion_h2("⚙️ Technical SEO Audit"),
-        notion_quote("PageSpeed scores, technical issues and fixes"),
-        notion_para(technical_seo_data[:2000]),
-        notion_divider(),
-
-        # GEO Analysis
-        notion_h2("🤖 GEO Analysis"),
-        notion_quote("AI engine visibility, entity optimisation and recommendations"),
-        notion_para(geo_data[:2000]),
-        notion_divider(),
-
-        # Local GEO
-        notion_h2("📍 Local & Regional GEO"),
-        notion_quote("Regional keyword opportunities and localisation gaps"),
-        notion_para(local_geo_data[:2000]),
-        notion_divider(),
-
-        # SEO Deficiencies
-        notion_h2("🔴 SEO Deficiencies"),
-    ]
-
-    # Add SEO deficiency bullets
-    seo_def_section = False
-    action_section = False
-    action_items = []
-    seo_items = []
-    geo_items = []
-    tech_items = []
-
-    for line in generated_content.split("\n"):
-        if "SEO DEFICIENCIES" in line:
-            seo_def_section = True
-            action_section = False
-        elif "GEO DEFICIENCIES" in line:
-            seo_def_section = False
-        elif "PRIORITY ACTION POINTS" in line:
-            action_section = True
-            seo_def_section = False
-        elif "OPTIMISED CONTENT" in line:
-            action_section = False
-
-        if seo_def_section and line.strip().startswith("-"):
-            seo_items.append(line.strip())
-        if action_section and line.strip() and line.strip()[0].isdigit():
-            action_items.append(line.strip())
-
-    for item in seo_items[:5]:
-        children.append(notion_bullet(item))
-
-    children.append(notion_divider())
-    children.append(notion_h2("✅ Priority Action Points"))
-    children.append(notion_quote("Ranked by impact — tackle top items first"))
-
-    for item in action_items[:15]:
-        children.append(notion_bullet(item))
-
-    children.append(notion_divider())
-
-    # Optimised Content section
-    children.append(notion_h2("✍️ Optimised Content"))
-
-    opt_section = False
-    opt_lines = []
-    for line in generated_content.split("\n"):
-        if "OPTIMISED CONTENT" in line:
-            opt_section = True
-        elif "SCHEMA MARKUP" in line:
-            opt_section = False
-        if opt_section and line.strip().startswith("-"):
-            opt_lines.append(line.strip())
-
-    for line in opt_lines[:6]:
-        children.append(notion_callout(line, "📝", "gray_background"))
-
-    children.append(notion_divider())
-    children.append(notion_h2("🏗️ Schema Markup Needed"))
-
-    schema_section = False
-    for line in generated_content.split("\n"):
-        if "SCHEMA MARKUP" in line:
-            schema_section = True
-        if schema_section and line.strip().startswith("-"):
-            children.append(notion_bullet(line.strip()))
-
-    response = requests.post(
-        "https://api.notion.com/v1/pages",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "Notion-Version": "2022-06-28"
-        },
-        json={
-            "parent": {"page_id": parent_id},
-            "properties": {
-                "title": {
-                    "title": [{"text": {"content": f"{domain} — {today}"}}]
-                }
-            },
-            "children": children
-        }
-    )
-
-    if response.status_code == 200:
-        page = response.json()
-        notion_url = page.get("url", "")
-        return {"success": True, "notion_url": notion_url}
-    else:
-        return {"success": False, "error": response.text}
-
-
-# -----------------------------
+# ============================================================
 # AGENT 1: Product Researcher
-# -----------------------------
+# ============================================================
 
 product_researcher = Agent(
     name="product_researcher",
-    model=model_name,
-    description="Scrapes and extracts data from any website or Shopify product page.",
+    model=MODEL_NAME,
+    description="Scrapes and extracts structured data from any website or Shopify product page.",
+    before_agent_callback=CB_SCRAPING,
+    generate_content_config=RETRY_CONFIG,
     instruction="""
 You are a website researcher.
 
 Find the URL in the conversation context.
-IMMEDIATELY use the scrape_website tool on that URL without asking anything.
+IMMEDIATELY use the scrape_website tool on that URL.
 
-From the scraped data extract and summarise:
-- Business name and what they do
-- Key services or products offered
-- Target audience if mentioned
-- Website title and meta description
-- Headings structure
-- Page content from paragraphs
-- Images and alt texts
-- Internal and external links
+The tool returns a complete structured JSON object with all SEO signals
+already computed. Do NOT reformat, summarise, or restructure the output.
 
-If scraping returns partial data or an error, use whatever is available
-and note the limitation. Construct the best possible business summary
-from whatever data was returned.
+Your ONLY job:
+1. Call scrape_website with the URL
+2. Output the tool result EXACTLY as returned — raw JSON, nothing else
+   No preamble, no markdown fences, no explanation, no changes.
 
-Do NOT ask the user for more information under any circumstances.
+If the tool returns an error field, output the error JSON as-is.
+Never ask the user for more information.
 """,
     tools=[scrape_website],
-    output_key="product_data"
+    output_key="product_data",
 )
 
 
-# -----------------------------
+# ============================================================
 # AGENT 2: SEO Researcher
-# -----------------------------
+# ============================================================
 
 seo_researcher = Agent(
     name="seo_researcher",
-    model=model_name,
-    description="Analyses website data and generates structured SEO keyword report.",
-    instruction="""
+    model=MODEL_NAME,
+    description="Analyses scraped website data and generates a structured SEO keyword report.",
+    before_agent_callback=CB_SEO,
+    generate_content_config=RETRY_CONFIG,
+    instruction=f"""
 You are an expert SEO strategist specialising in ecommerce and service businesses.
 
-Use the product_data from the previous agent to generate a structured SEO report.
-Do NOT ask the user for more information. Work with what has been scraped.
+Read product_data from session state. It is a JSON object — parse it directly.
 
-Generate:
-1. **Primary Keywords** (2-3) - highest volume, most relevant
-2. **Long Tail Keywords** (5-7) - specific phrases buyers search for
-3. **Informational Keywords** - what, how, why queries
-4. **Commercial Keywords** - buy, best, hire, review queries
-5. **Target Audience** - who is searching for this
-6. **Technical SEO Issues** - missing meta tags, poor heading structure, missing alt texts
-7. **Search Intent Summary** - what is the visitor looking for
+IMPORTANT: The following are already computed in product_data — copy them
+into your output, do NOT recompute them:
+- meta_issues → copy from product_data.meta.issues
+- heading_issues → copy from product_data.headings.issues
+- image_alt_issues → list the first 5 items from product_data.images_missing_alt
 
-Do NOT ask for clarification. Generate the best possible report from available data.
+Your job: generate keyword strategy, search intent analysis, and content recommendations.
+
+content_score: integer 0-100 representing overall content quality based on
+word count, heading structure, meta quality, and paragraph depth.
+
+You MUST respond with ONLY valid JSON matching this exact schema.
+No preamble, no markdown fences, no explanation — raw JSON only.
+
+Schema:
+{SEO_DATA_SCHEMA}
+
+Do NOT ask for clarification. Generate from product_data.
 """,
-    output_key="seo_data"
+    output_key="seo_data",
 )
 
 
-# -----------------------------
+# ============================================================
 # AGENT 3: Competitor Agent
-# -----------------------------
+# ============================================================
 
 competitor_agent = Agent(
     name="competitor_agent",
-    model=model_name,
-    description="Identifies and analyses top competitors based on primary keywords.",
-    instruction="""
+    model=MODEL_NAME,
+    description="Discovers and analyses real SERP competitors.",
+    before_agent_callback=CB_COMPETITORS,
+    generate_content_config=RETRY_CONFIG,
+    instruction=f"""
 You are a competitive intelligence specialist.
 
-Using the product_data and seo_data from previous agents:
+Read product_data and seo_data from session state (both JSON objects).
 
-STEP 1: Based on the business type and primary keywords, identify 5 likely
-competitor websites. Use your knowledge to identify real competitors in this
-industry/niche. Think about who ranks for these primary keywords.
+STEP 1: Call discover_competitors with:
+  - keywords: the primary keywords array from seo_data.keywords.primary
+  - target_url: the url field from product_data
 
-STEP 2: Use the scrape_competitor tool on each of the 5 competitor URLs.
-Call it 5 times, once per competitor.
+STEP 2: Check the result:
+  - source = "serpapi" → best quality, use the competitor_urls list
+  - source = "duckduckgo" → good quality, use the competitor_urls list.
+    Note "Results sourced via DuckDuckGo" in your analysis.
+  - source = "none" OR competitor_urls is empty → both sources failed.
+    Use your own knowledge to identify 5 real competitors for this
+    business type and niche. Populate them with what you know.
+    Set has_schema based on what is typical for this industry.
+    Set strengths based on what these competitors are known for.
+    Note "Competitor discovery unavailable — using knowledge base" in your analysis.
 
-STEP 3: Analyse and compare all competitors against the target site:
+STEP 3: For each competitor URL from Step 2, call scrape_competitor.
+Skip this step only if source was "none".
 
-## COMPETITOR ANALYSIS
+STEP 4: For each scraped competitor, assess their strengths based on their
+title, headings, schema types, and meta description. Fill the strengths list
+with 2-3 specific observations.
 
-### Competitors Identified:
-List each competitor with their URL and what they do.
+STEP 5: Compare all competitors against product_data and seo_data to identify:
+keyword_gaps, content_gaps, schema_gaps, what_competitors_do_better, opportunities.
 
-### Keyword Gaps:
-Keywords competitors are targeting that the target site is missing.
+You MUST respond with ONLY valid JSON matching this exact schema.
+No preamble, no markdown fences, no explanation — raw JSON only.
 
-### Content Gaps:
-Types of content competitors have that the target site lacks.
+Schema:
+{COMPETITOR_DATA_SCHEMA}
 
-### Schema Markup Comparison:
-What structured data competitors use vs target site.
-
-### Heading Structure Comparison:
-How competitors structure their H1/H2s vs target site.
-
-### What Competitors Do Better:
-Top 5 things competitors do that the target site should adopt.
-
-### Opportunities:
-Top 3 areas where the target site can outperform competitors.
-
-Do NOT ask for clarification. Use your knowledge to identify real competitors.
+Do NOT ask for clarification.
 """,
-    tools=[scrape_competitor],
-    output_key="competitor_data"
+    tools=[discover_competitors, scrape_competitor],
+    output_key="competitor_data",
 )
 
 
-# -----------------------------
+# ============================================================
 # AGENT 4: Technical SEO Agent
-# -----------------------------
+# ============================================================
 
 technical_seo_agent = Agent(
     name="technical_seo_agent",
-    model=model_name,
-    description="Performs technical SEO audit including PageSpeed analysis.",
+    model=MODEL_NAME,
+    description="Performs technical SEO audit including full Core Web Vitals analysis.",
+    before_agent_callback=CB_TECHNICAL,
+    generate_content_config=RETRY_CONFIG,
     instruction="""
 You are a technical SEO specialist.
 
-Using the product_data from the product_researcher and the URL from the conversation:
+Read product_data from session state and extract the url field.
 
-STEP 1: Use the check_pagespeed tool on the website URL to get performance scores.
+STEP 1: Call check_pagespeed with that URL.
 
-STEP 2: Analyse the technical data from product_data combined with PageSpeed results.
+STEP 2: The tool returns a result. Output the result as raw JSON.
 
-Generate a complete technical SEO audit:
+CRITICAL: If the tool result is wrapped in a key like "check_pagespeed_response",
+extract and output ONLY the inner object — not the wrapper.
 
-## TECHNICAL SEO AUDIT
+Example: if tool returns {"check_pagespeed_response": {"url": "...", "scores": {...}}}
+you output: {"url": "...", "scores": {...}}
 
-### PageSpeed Scores:
-- Performance: [X/100]
-- Accessibility: [X/100]
-- SEO: [X/100]
-- Best Practices: [X/100]
+If the result contains an "error" field → output this JSON exactly:
+{
+  "url": "[the url]",
+  "mobile_scores": {"performance": 0, "accessibility": 0, "seo": 0, "best_practices": 0},
+  "desktop_scores": {"performance": 0, "accessibility": 0, "seo": 0, "best_practices": 0},
+  "score_delta": {"performance": 0, "accessibility": 0, "seo": 0, "best_practices": 0},
+  "lcp_ms": null, "cls_score": null, "fid_ms": null, "ttfb_ms": null,
+  "render_blocking_resources": [],
+  "opportunities": [],
+  "diagnostics": [{"id": "api_error", "title": "PageSpeed API unavailable",
+    "description": "Could not retrieve scores", "score": 0, "impact": "high",
+    "savings_ms": null}],
+  "technical_seo_score": 0,
+  "cwv_display": {"lcp": "N/A", "cls": "N/A", "fid": "N/A",
+    "ttfb": "N/A", "fcp": "N/A", "tbt": "N/A"}
+}
 
-### Critical Issues (fix immediately):
-List issues with High impact label and exact fix.
-
-### H1 Tag Analysis:
-Number of H1 tags found, what they say, what they should say.
-
-### Meta Tags Analysis:
-Meta description — present/missing, length, quality score.
-
-### Image Optimisation:
-Number of images missing alt text, examples, impact.
-
-### URL Structure Issues:
-Any problematic URLs found with fix recommendations.
-
-### Page Speed Issues:
-Top issues from PageSpeed with fix recommendations.
-
-### Schema Markup Status:
-What schema is present, what is missing.
-
-### Technical SEO Score: [X/10]
-Overall assessment with reasoning.
-
+Raw JSON only. No preamble, no markdown fences.
 Do NOT ask for clarification. Run the tool immediately.
 """,
     tools=[check_pagespeed],
-    output_key="technical_seo_data"
+    output_key="technical_seo_data",
 )
 
 
-# -----------------------------
+# ============================================================
 # AGENT 5: GEO Researcher
-# -----------------------------
+# ============================================================
 
 geo_researcher = Agent(
     name="geo_researcher",
-    model=model_name,
+    model=MODEL_NAME,
     description="Analyses GEO visibility for AI-generated search answers.",
-    instruction="""
+    before_agent_callback=CB_GEO,
+    generate_content_config=RETRY_CONFIG,
+    instruction=f"""
 You are an expert in Generative Engine Optimisation (GEO).
 
-Use the product_data and seo_data from previous agents.
-Do NOT ask the user for more information. Work with what has been provided.
+Read product_data and seo_data from session state (both JSON objects).
 
-Analyse:
-1. **AI Visibility Score** - estimate 1-10 how likely this site appears in AI answers
-2. **Entity Optimisation** - is the brand clearly defined as an entity?
-3. **FAQ Opportunities** - 5 questions AI engines commonly answer about this business
-4. **Content Gaps** - what authoritative content is missing that AI would cite?
-5. **GEO Recommendations** - specific actions to improve AI engine visibility
-6. **Schema Markup Suggestions** - what structured data should be added
+Produce:
+- ai_visibility_score: 1-10 estimate of how likely this site appears in AI answers.
+  Base this on: entity clarity, schema presence, content authority signals,
+  FAQ-style content, and brand mentions.
+- entity_optimisation: is the brand clearly defined as a named entity with
+  consistent NAP (Name, Address, Phone) and schema?
+- faq_opportunities: 5 questions AI engines commonly answer about this
+  business type — questions the site should explicitly answer.
+- content_gaps: authoritative content that is missing and that AI would cite
+  if it existed (e.g. "About Us page lacks founder story", "No pricing page").
+- geo_recommendations: specific, actionable steps to improve AI engine visibility.
+- schema_suggestions: structured data types that would improve AI discoverability.
 
-Do NOT ask for clarification. Generate the best possible analysis from available data.
+You MUST respond with ONLY valid JSON matching this exact schema.
+No preamble, no markdown fences, no explanation — raw JSON only.
+
+Schema:
+{GEO_DATA_SCHEMA}
+
+Do NOT ask for clarification.
 """,
-    output_key="geo_data"
+    output_key="geo_data",
 )
 
 
-# -----------------------------
+# ============================================================
 # AGENT 6: Local GEO Agent
-# -----------------------------
+# ============================================================
 
 local_geo_agent = Agent(
     name="local_geo_agent",
-    model=model_name,
+    model=MODEL_NAME,
     description="Analyses local and regional GEO keyword opportunities.",
-    instruction="""
+    before_agent_callback=CB_LOCAL_GEO,
+    generate_content_config=RETRY_CONFIG,
+    instruction=f"""
 You are an expert in local and regional SEO and GEO optimisation.
 
-Use product_data, seo_data, and geo_data from previous agents.
-Do NOT ask the user for more information.
+Read product_data, seo_data, and geo_data from session state (all JSON objects).
 
-Generate a local and regional GEO analysis:
+Produce:
+- global_market_opportunities: top 5 markets as
+  {{region, keywords: [list], volume: "High|Medium|Low", recommendations: [list]}}
+- language_gaps: languages that would meaningfully increase traffic
+- regional_keywords: 10 keywords as {{keyword, region, intent}}
+- local_schema_needed: true/false
+- local_schema_fields: if true, list the LocalBusiness fields needed
+- ai_visibility_by_region: for 3-5 regions:
+  {{region, visibility: "High|Medium|Low", content_needed: [list]}}
+- local_geo_score: 0-10 overall local/regional optimisation score
 
-## LOCAL GEO ANALYSIS
+You MUST respond with ONLY valid JSON matching this exact schema.
+No preamble, no markdown fences, no explanation — raw JSON only.
 
-### Global Market Opportunities:
-Top 5 global markets this business should target based on their services.
-For each market:
-- Region/Country
-- Local keyword variations
-- Search volume potential (High/Medium/Low)
-- Localisation recommendations
+Schema:
+{LOCAL_GEO_SCHEMA}
 
-### Language & Localisation Gaps:
-Is the site available in multiple languages? Should it be?
-What languages would drive the most traffic?
-
-### Regional Keyword Opportunities:
-10 region-specific long tail keywords not currently targeted.
-Format: [keyword] — [region] — [intent]
-
-### Local Schema Markup:
-Should LocalBusiness schema be added? What fields are needed?
-
-### AI Visibility by Region:
-Which regions is this business most/least visible in AI answers?
-What content would improve regional AI visibility?
-
-### Local GEO Score: [X/10]
-Overall local/regional optimisation assessment.
-
-Do NOT ask for clarification. Generate from available data.
+Do NOT ask for clarification.
 """,
-    output_key="local_geo_data"
+    output_key="local_geo_data",
 )
 
 
-# -----------------------------
+# ============================================================
 # AGENT 7: Report Generator
-# -----------------------------
+# ============================================================
 
 copywriter_agent = Agent(
     name="copywriter_agent",
-    model=model_name,
-    description="Generates structured SEO and GEO scoring report with action points.",
-    instruction="""
+    model=MODEL_NAME,
+    description="Compiles all agent outputs into the final structured scoring report.",
+    before_agent_callback=CB_REPORT,
+    generate_content_config=RETRY_CONFIG,
+    instruction=f"""
 You are an expert SEO and GEO analyst.
 
-Use ALL data from previous agents:
-- product_data, seo_data, competitor_data
-- technical_seo_data, geo_data, local_geo_data
+Read ALL of these from session state (all JSON objects):
+  product_data, seo_data, competitor_data,
+  technical_seo_data, geo_data, local_geo_data
 
-Do NOT generate HTML. Generate a clean structured report.
+Compile the complete analysis. All scores are integers 0-10.
 
-Generate in this EXACT format:
+Score derivation rules:
+  scores.technical_seo    → use technical_seo_data.technical_seo_score directly
+  scores.seo              → derive from seo_data.content_score (divide by 10, round)
+  scores.geo              → use geo_data.ai_visibility_score directly
+  scores.local_geo        → use local_geo_data.local_geo_score directly
+  scores.competitor_position → assess 0-10 how well target competes vs competitor_data findings
+  scores.overall          → average of all five scores, rounded
 
-## OVERALL SCORES
-- SEO Score: [X/10] — [one line reasoning]
-- GEO Score: [X/10] — [one line reasoning]
-- Technical SEO Score: [X/10] — [one line reasoning]
-- Competitor Position: [X/10] — [how well positioned vs competitors]
-- Local GEO Score: [X/10] — [one line reasoning]
-- Overall Digital Visibility: [X/10]
+priority_actions must have exactly 15 items.
+Each item: {{rank: 1-15, action: "...", expected_outcome: "...", effort: "Hours|Days|Weeks"}}
+Ranked highest impact first. effort = realistic time to implement the action.
 
-## SEO DEFICIENCIES
-Top 5 specific issues:
-- Issue: [what is wrong] | Impact: [High/Medium/Low] | Fix: [exact action]
+social_deficiencies: derive from product_data.social.issues — convert each issue
+into a DeficiencyItem with appropriate impact and fix.
 
-## GEO DEFICIENCIES
-Top 5 specific issues:
-- Issue: [what is wrong] | Impact: [High/Medium/Low] | Fix: [exact action]
+schema_markup_needed: for each schema type recommended, generate an object with
+EXACTLY these three fields (no other field names):
+  - "type": string — the schema type name e.g. "Organization"
+  - "description": string — one line on why it's needed
+  - "json_ld": string — the COMPLETE ready-to-paste JSON-LD as a JSON string
+    Use real data from product_data (site_name for name, url, meta.content for description,
+    social.profiles_found for sameAs).
 
-## TECHNICAL SEO DEFICIENCIES
-Top 5 specific issues:
-- Issue: [what is wrong] | Impact: [High/Medium/Low] | Fix: [exact action]
+Example of ONE correct schema_markup_needed item:
+{{
+  "type": "Organization",
+  "description": "Defines the business entity for search engines and AI.",
+  "json_ld": "{{\\n  \\"@context\\": \\"https://schema.org\\",\\n  \\"@type\\": \\"Organization\\",\\n  \\"name\\": \\"Tech Wishes Solutions\\",\\n  \\"url\\": \\"https://techwishes.com/\\"\\n}}"
+}}
 
-## COMPETITOR GAPS
-Top 3 things competitors do better:
-- Gap: [what competitors do] | Fix: [how to match or exceed them]
+DO NOT use "@type" as the field name — use "type".
+DO NOT use "@context" as the field name — use "type".
+The json_ld value must be a valid JSON string (escaped properly).
 
-## PRIORITY ACTION POINTS
-15 actions ranked by priority:
-1. [Action] — [Expected outcome]
-2. [Action] — [Expected outcome]
-3. [Action] — [Expected outcome]
-4. [Action] — [Expected outcome]
-5. [Action] — [Expected outcome]
-6. [Action] — [Expected outcome]
-7. [Action] — [Expected outcome]
-8. [Action] — [Expected outcome]
-9. [Action] — [Expected outcome]
-10. [Action] — [Expected outcome]
-11. [Action] — [Expected outcome]
-12. [Action] — [Expected outcome]
-13. [Action] — [Expected outcome]
-14. [Action] — [Expected outcome]
-15. [Action] — [Expected outcome]
+optimised_content.meta_description_variants: generate 3 variants:
+  - variant 1: ~120 chars (for tight spaces)
+  - variant 2: ~140 chars (standard)
+  - variant 3: ~155 chars (maximum, most descriptive)
 
-## OPTIMISED CONTENT
-- SEO Title: [optimised title]
-- Meta Description: [under 160 characters]
-- Primary Keywords: [list]
-- Long Tail Keywords: [list]
+You MUST respond with ONLY valid JSON matching this exact schema.
+No preamble, no markdown fences, no explanation — raw JSON only.
 
-## SCHEMA MARKUP NEEDED
-- [Schema type]: [one line description]
-
-Do NOT ask for clarification. Generate the complete report.
+Schema:
+{REPORT_SCHEMA}
 """,
-    output_key="generated_content"
+    output_key="generated_content",
 )
 
 
-# -----------------------------
+# ============================================================
 # AGENT 8: Notion Report Agent
-# -----------------------------
+# ============================================================
 
 notion_report_agent = Agent(
     name="notion_report_agent",
-    model=model_name,
+    model=MODEL_NAME,
     description="Saves the complete decorated SEO and GEO report to Notion.",
+    before_agent_callback=CB_NOTION,
+    generate_content_config=RETRY_CONFIG,
     instruction="""
 You are responsible for saving the complete analysis report to Notion.
 
-Call create_notion_report IMMEDIATELY with ALL of these parameters:
-- url: the website URL from the conversation
-- product_data: complete output from product_researcher
-- seo_data: complete output from seo_researcher
-- competitor_data: complete output from competitor_agent
-- technical_seo_data: complete output from technical_seo_agent
-- geo_data: complete output from geo_researcher
-- local_geo_data: complete output from local_geo_agent
-- generated_content: complete output from copywriter_agent
+Read product_data from session state and use product_data.url as the target URL.
+Read the user's email from the conversation history — it was the email address
+the user provided at the very start of the conversation.
 
-Do NOT summarise or shorten any data.
+Call create_notion_report IMMEDIATELY with ALL of these parameters:
+- url: product_data.url
+- product_data: complete JSON string output from product_researcher
+- seo_data: complete JSON string output from seo_researcher
+- competitor_data: complete JSON string output from competitor_agent
+- technical_seo_data: complete JSON string output from technical_seo_agent
+- geo_data: complete JSON string output from geo_researcher
+- local_geo_data: complete JSON string output from local_geo_agent
+- generated_content: complete JSON string output from copywriter_agent
+
+Do NOT summarise, shorten, or reformat any data.
 Do NOT ask for confirmation.
 Call the tool as your very first action.
 
-After the tool returns:
-- If success is True output exactly:
-  NOTION_URL: [the notion_url value from the response]
-- If success is False output exactly:
-  NOTION_ERROR: [the error value from the response]
+After the tool returns output EXACTLY these two lines and nothing else:
+NOTION_URL: [notion_url from response]
+USER_EMAIL: [the email address the user gave at the start]
+
+If the tool fails output:
+NOTION_ERROR: [error message]
+USER_EMAIL: [the email address the user gave at the start]
+
+Always output USER_EMAIL on the second line no matter what.
 """,
     tools=[create_notion_report],
-    output_key="notion_page_url"
+    output_key="notion_page_url",
 )
 
 
-# -----------------------------
+# ============================================================
 # AGENT 9: AgentMail Delivery
-# -----------------------------
+# ============================================================
 
 agentmail_delivery_agent = Agent(
     name="agentmail_delivery_agent",
-    model=model_name,
+    model=MODEL_NAME,
     description="Delivers the Notion report link to the user via email.",
+    before_agent_callback=CB_EMAIL,
+    generate_content_config=RETRY_CONFIG,
     instruction="""
 You are responsible for delivering the completed report to the user via email.
 
-IMPORTANT - use these exact tool names:
-- list_inboxes — to list available inboxes
-- send_message — to send an email
+Read notion_page_url from session state. Parse it line by line:
+  - Line containing "NOTION_URL:": extract the URL after the colon and space
+  - Line containing "USER_EMAIL:": extract the email after the colon and space
+
+Also read product_data.url from session state for the website domain.
+Also parse generated_content (JSON) for scores and priority_actions.
+
+Tool names:
+  list_inboxes  — lists available inboxes
+  send_message  — sends an email
 
 Steps:
-1. Use list_inboxes to get the inbox ID for seoagent@agentmail.to
-2. Look for a line starting with "NOTION_URL:" in the previous agent output
-3. Find the user's email address from the conversation
-4. Use send_message with:
-   - inbox_id: ID from step 1
-   - to: user's email address
-   - subject: "Your SEO + GEO Report is Ready — [website domain]"
+1. Call list_inboxes — find inbox where address = "seoagent@agentmail.to", note its id.
+
+2. Call send_message with:
+   - inbox_id: id from step 1
+   - to: the USER_EMAIL value you extracted above (exact, no changes)
+   - subject: "Your SEO + GEO Report is Ready — [domain from product_data.url]"
    - body:
-     Hi,
+       Hi,
 
-     Your SEO and GEO analysis for [website URL] is complete.
+       Your SEO and GEO analysis is complete.
 
-     SCORES:
-     [extract all scores from generated_content]
+       SCORES:
+       SEO: [scores.seo]/10
+       GEO: [scores.geo]/10
+       Technical SEO: [scores.technical_seo]/10
+       Competitor Position: [scores.competitor_position]/10
+       Local GEO: [scores.local_geo]/10
+       Overall: [scores.overall]/10
 
-     TOP 3 PRIORITY ACTIONS:
-     [extract top 3 action points from generated_content]
+       TOP 3 PRIORITY ACTIONS:
+       1. [priority_actions[0].action] — [priority_actions[0].expected_outcome]
+       2. [priority_actions[1].action] — [priority_actions[1].expected_outcome]
+       3. [priority_actions[2].action] — [priority_actions[2].expected_outcome]
 
-     View your full decorated report with competitor analysis,
-     technical audit, GEO scores and action points here:
-     [NOTION_URL]
+       View your full report here:
+       [NOTION_URL]
 
-     Best regards,
-     SEO GEO Assistant
+       Best regards,
+       SEO GEO Assistant
 
-If send_message fails output exactly:
-EMAIL_FAILED: true
-NOTION_URL: [notion url]
+3. After send_message:
+   - Success → output: EMAIL_SENT: true to [USER_EMAIL]
+   - Failure → output:
+       EMAIL_FAILED: true
+       Your Notion report is here: [NOTION_URL]
+
+CRITICAL: Always call send_message. Never skip it.
 """,
     tools=[agentmail_toolset],
-    output_key="email_status"
+    output_key="email_status",
 )
 
 
-# -----------------------------
-# DELIVERY WORKFLOW (Sequential)
-# -----------------------------
+# ============================================================
+# PARALLEL GROUPS
+# Agents 2, 3, 4 run simultaneously after product_researcher.
+# Agents 5, 6 run simultaneously after seo_data is ready.
+# ============================================================
+
+# ============================================================
+# PARALLEL GROUP — analysis only (SEO + competitors + technical)
+# GEO agents run sequentially to avoid Vertex AI 429 quota errors.
+# Parallelising 2 lightweight agents saves ~20s but causes crashes
+# on standard quota — not worth the tradeoff.
+# ============================================================
+
+parallel_analysis = ParallelAgent(
+    name="parallel_analysis",
+    description="Runs SEO research, competitor discovery, and technical audit simultaneously.",
+    sub_agents=[seo_researcher, competitor_agent, technical_seo_agent],
+)
+
+
+# ============================================================
+# DELIVERY WORKFLOW
+# ============================================================
 
 delivery_workflow = SequentialAgent(
     name="delivery_workflow",
     description="Saves report to Notion then delivers link via AgentMail.",
-    sub_agents=[
-        notion_report_agent,
-        agentmail_delivery_agent
-    ]
+    sub_agents=[notion_report_agent, agentmail_delivery_agent],
 )
 
 
-# -----------------------------
-# MAIN SEO GEO WORKFLOW (Sequential)
-# -----------------------------
+# ============================================================
+# MAIN SEO GEO WORKFLOW
+# ============================================================
 
 seo_geo_workflow = SequentialAgent(
     name="seo_geo_workflow",
     description="Full SEO and GEO analysis pipeline.",
     sub_agents=[
-        product_researcher,
-        seo_researcher,
-        competitor_agent,
-        technical_seo_agent,
-        geo_researcher,
-        local_geo_agent,
-        copywriter_agent,
-        delivery_workflow
-    ]
+        product_researcher,   # Step 1: scrape target
+        parallel_analysis,    # Step 2: SEO + competitors + technical (parallel)
+        geo_researcher,       # Step 3: GEO analysis (sequential — quota safety)
+        local_geo_agent,      # Step 4: local GEO analysis (sequential)
+        copywriter_agent,     # Step 5: compile report
+        delivery_workflow,    # Step 6: Notion + email
+    ],
 )
 
 
-# -----------------------------
+# ============================================================
 # ROOT AGENT
-# -----------------------------
+# ============================================================
 
 root_agent = Agent(
     name="seo_geo_assistant",
-    model=model_name,
+    model=MODEL_NAME,
     description="SEO and GEO optimisation assistant for any website or Shopify store.",
+    generate_content_config=RETRY_CONFIG,
     instruction="""
 You are a helpful SEO and GEO optimisation assistant.
 
@@ -1018,15 +680,25 @@ Ask the user for only two things:
 
 Tell them: "I will extract your business information automatically from your website."
 
-Once you have both, output exactly:
-URL: [url]
-EMAIL: [email]
+Once you have BOTH the URL and email, reply with EXACTLY this message:
+"✅ Got it! Starting your full SEO + GEO analysis for [URL].
+
+Here's what's happening:
+⏳ [1/7] Scraping your website...
+⏳ [2/7] Running SEO research, competitor discovery and PageSpeed audit in parallel...
+⏳ [3/7] GEO analysis...
+⏳ [4/7] Local and regional GEO analysis...
+⏳ [5/7] Compiling your scored report...
+⏳ [6/7] Saving to Notion...
+⏳ [7/7] Emailing your report...
+
+⚠️ PageSpeed audit takes 60-90 seconds — total analysis is typically 4-6 minutes.
+Progress updates will appear below as each stage completes."
 
 Then immediately transfer control to seo_geo_workflow.
+Do not call any tools.
 Do not ask for anything else.
-Do not continue the conversation after transferring.
-Do not summarize or comment on the workflow output.
-If email delivery fails, share the NOTION_URL directly with the user.
+Do not add any extra commentary.
 """,
-    sub_agents=[seo_geo_workflow]
+    sub_agents=[seo_geo_workflow],
 )
